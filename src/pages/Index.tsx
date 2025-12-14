@@ -3,12 +3,14 @@ import { Trash2, FileText, Cpu } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { PDFUpload } from '@/components/PDFUpload';
 import { ChatMessage, Message } from '@/components/ChatMessage';
-import { ChatInput } from '@/components/ChatInput';
+import { ChatInput, ChatMode } from '@/components/ChatInput';
 import { ModelStatus } from '@/components/ModelStatus';
+import { EvaluationResult } from '@/components/EvaluationResult';
 import { extractTextFromPDF, chunkText } from '@/lib/pdf-parser';
 import { initializeEmbeddings, isModelLoaded } from '@/lib/embeddings';
 import { vectorStore } from '@/lib/vector-store';
 import { generateAnswer } from '@/lib/answer-generator';
+import { evaluateAnswer, EvaluationResult as EvalResultType } from '@/lib/answer-evaluator';
 import { toast } from '@/hooks/use-toast';
 
 type ModelState = 'idle' | 'loading' | 'ready' | 'error';
@@ -23,6 +25,9 @@ export default function Index() {
   const [modelProgress, setModelProgress] = useState(0);
   const [modelMessage, setModelMessage] = useState('Model not loaded');
   const [documentReady, setDocumentReady] = useState(false);
+  const [chatMode, setChatMode] = useState<ChatMode>('chat');
+  const [pendingEvalQuery, setPendingEvalQuery] = useState<string | null>(null);
+  const [lastEvalResult, setLastEvalResult] = useState<EvalResultType | null>(null);
   
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -130,6 +135,65 @@ export default function Index() {
       return;
     }
 
+    // Evaluation mode flow
+    if (chatMode === 'evaluate') {
+      if (!pendingEvalQuery) {
+        // First message: topic/query
+        setPendingEvalQuery(content);
+        const topicMessage: Message = {
+          id: `user-${Date.now()}`,
+          role: 'user',
+          content: `📋 **Evaluation Topic:** ${content}`,
+          timestamp: new Date(),
+        };
+        const promptMessage: Message = {
+          id: `system-${Date.now()}`,
+          role: 'system',
+          content: 'Now provide your answer to evaluate against the document.',
+          timestamp: new Date(),
+        };
+        setMessages(prev => [...prev, topicMessage, promptMessage]);
+        return;
+      } else {
+        // Second message: student answer to evaluate
+        const userMessage: Message = {
+          id: `user-${Date.now()}`,
+          role: 'user',
+          content,
+          timestamp: new Date(),
+        };
+        setMessages(prev => [...prev, userMessage]);
+        setIsQuerying(true);
+
+        try {
+          const result = await evaluateAnswer(content, pendingEvalQuery);
+          setLastEvalResult(result);
+          
+          const evalMessage: Message = {
+            id: `eval-${Date.now()}`,
+            role: 'assistant',
+            content: `__EVAL_RESULT__`,
+            timestamp: new Date(),
+          };
+          setMessages(prev => [...prev, evalMessage]);
+        } catch (error) {
+          console.error('Evaluation error:', error);
+          const errorMessage: Message = {
+            id: `error-${Date.now()}`,
+            role: 'assistant',
+            content: 'An error occurred during evaluation. Please try again.',
+            timestamp: new Date(),
+          };
+          setMessages(prev => [...prev, errorMessage]);
+        } finally {
+          setIsQuerying(false);
+          setPendingEvalQuery(null);
+        }
+        return;
+      }
+    }
+
+    // Regular Q&A mode
     const userMessage: Message = {
       id: `user-${Date.now()}`,
       role: 'user',
@@ -164,6 +228,12 @@ export default function Index() {
     } finally {
       setIsQuerying(false);
     }
+  };
+
+  const handleModeChange = (mode: ChatMode) => {
+    setChatMode(mode);
+    setPendingEvalQuery(null);
+    setLastEvalResult(null);
   };
 
   const clearChat = () => {
@@ -252,13 +322,21 @@ export default function Index() {
           ) : (
             <div className="divide-y divide-border">
               {messages.map(message => (
-                <ChatMessage key={message.id} message={message} />
+                message.content === '__EVAL_RESULT__' && lastEvalResult ? (
+                  <div key={message.id} className="p-4 bg-chat-assistant">
+                    <EvaluationResult result={lastEvalResult} />
+                  </div>
+                ) : (
+                  <ChatMessage key={message.id} message={message} />
+                )
               ))}
               {isQuerying && (
                 <div className="p-4 bg-chat-assistant">
                   <div className="flex items-center gap-2 text-sm text-muted-foreground">
                     <div className="w-2 h-2 bg-primary rounded-full animate-pulse" />
-                    <span className="font-mono">Searching document...</span>
+                    <span className="font-mono">
+                      {chatMode === 'evaluate' ? 'Evaluating answer...' : 'Searching document...'}
+                    </span>
                   </div>
                 </div>
               )}
@@ -271,12 +349,19 @@ export default function Index() {
         <ChatInput
           onSend={handleSendMessage}
           disabled={!documentReady || isQuerying || isProcessing}
+          mode={chatMode}
+          onModeChange={handleModeChange}
+          showModeToggle={documentReady}
           placeholder={
             !file 
-              ? 'Upload a PDF to start chatting...' 
+              ? 'Upload a PDF to start...' 
               : isProcessing 
                 ? 'Processing document...' 
-                : 'Ask a question about your document...'
+                : chatMode === 'evaluate'
+                  ? pendingEvalQuery
+                    ? 'Enter your answer to evaluate...'
+                    : 'Enter the topic/question to evaluate against...'
+                  : 'Ask a question about your document...'
           }
         />
       </main>
